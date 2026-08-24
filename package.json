@@ -1,20 +1,20 @@
 {
-  "name": "price-webscraper",
+  "name": "hola-argentina-api",
   "version": "1.0.0",
-  "description": "",
+  "description": "API Node/Express para Hola Argentina",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
     "start:local": "node index.js"
   },
-  "repository": "git+https://github.com/devcaballero/price-webscraper.git",
+  "repository": "git+https://github.com/devcaballero/hola-argentina-api.git",
   "author": "claudiocaballero.dev@gmail.com",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/devcaballero/price-webscraper/issues"
+    "url": "https://github.com/devcaballero/hola-argentina-api/issues"
   },
-  "homepage": "https://github.com/devcaballero/price-webscraper#readme",
+  "homepage": "https://github.com/devcaballero/hola-argentina-api#readme",
   "dependencies": {
     "axios": "^1.4.0",
     "cheerio": "^1.0.0-rc.12",
