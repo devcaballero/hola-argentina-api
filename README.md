@@ -48,6 +48,7 @@ curl http://localhost:3000/api/v1/bitcoin
 | GET | `/api/v1/inflacion-mensual` | IPC mensual + período + historial 6 meses |
 | GET | `/api/v1/inflacion-anualizada` | IPC interanual + período |
 | GET | `/api/v1/tasa-bcra` | BADLAR/TPM + historial mensual 6 meses |
+| GET | `/api/v1/riesgo-pais` | EMBI+ (pb) + variación + historial 7 días |
 | GET | `/api/v1/temperatura` | Clima BA + forecast 7 días (condición, viento, humedad, salida/puesta) |
 | GET | `/api/v1/minimo-sube` | Tarifa mínima AMBA |
 | GET | `/api/v1/nafta-super` | Nafta súper |
@@ -64,6 +65,7 @@ Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual pu
 - Oro: [goldprice.dev](https://goldprice.dev) spot + barras diarias
 - Inflación: [apis.datos.gob.ar](https://apis.datos.gob.ar) (IPC nacional)
 - Tasa: [API BCRA v4](https://api.bcra.gob.ar) monetarias — BADLAR → TPM
+- Riesgo país: [ArgentinaDatos](https://api.argentinadatos.com) EMBI+ (serie → último)
 - Clima (en paralelo; se prefiere forecast de 7 días):
   1. [Open-Meteo](https://open-meteo.com) (varios transportes / IPv4)
   2. [Met.no](https://api.met.no) locationforecast (rescate 7 días)
@@ -71,13 +73,13 @@ Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual pu
   - Si faltan salida/puesta (Met.no no las trae; wttr solo ~3 días), se completan con cálculo local NOAA para CABA (UTC−3)
 - Big Mac: [bigmacindex.com](https://bigmacindex.com) → CSV [The Economist](https://github.com/TheEconomist/big-mac-data)
 
-Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h) para no martillar las fuentes.
+Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h, riesgo país ~1h) para no martillar las fuentes.
 
 ## Fallbacks
 
 Helper reutilizable en `lib/fallbacks.js`:
 
-- `withFallbacks(sources, { label })` — cadena secuencial (primera fuente válida gana). Usado en Bitcoin, Big Mac y tasa BCRA.
+- `withFallbacks(sources, { label })` — cadena secuencial (primera fuente válida gana). Usado en Bitcoin, Big Mac, tasa BCRA y riesgo país.
 - `collectFromSources(sources, { label })` — acumula las que respondan (promedios asado/pan).
 
 Clima usa `Promise.allSettled` propio (Open-Meteo / Met.no / wttr) más `ensureForecastSunTimes` para astronomía.

@@ -1018,6 +1018,124 @@ app.get('/api/v1/tasa-bcra', async (_req, res) => {
   }
 });
 
+const RIESGO_PAIS_TTL_MS = 60 * 60 * 1000;
+let riesgoPaisCache = null;
+
+function formatPb(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Number.isInteger(n)) return String(n);
+  return n.toFixed(1).replace('.', ',');
+}
+
+function parseRiesgoPaisRows(data) {
+  const rows = Array.isArray(data) ? data : data ? [data] : [];
+  const series = rows
+    .filter((row) => row && row.fecha && Number.isFinite(Number(row.valor)))
+    .map((row) => ({
+      fecha: String(row.fecha).slice(0, 10),
+      valorNum: Number(row.valor),
+    }))
+    .sort((a, b) => a.fecha.localeCompare(b.fecha));
+  if (!series.length) throw new Error('serie riesgo país vacía');
+  return series;
+}
+
+async function fetchRiesgoPaisSeries(client) {
+  const { data } = await client.get(
+    'https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais'
+  );
+  return parseRiesgoPaisRows(data);
+}
+
+async function fetchRiesgoPaisUltimo(client) {
+  const { data } = await client.get(
+    'https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo'
+  );
+  return parseRiesgoPaisRows(data);
+}
+
+/** Últimas N observaciones (días hábiles; fines de semana suele no haber dato). */
+function buildRiesgoPaisHistorial(series, days = 7) {
+  if (!series.length) return [];
+
+  const window = series.slice(-(days + 1));
+  const visible = window.slice(-days);
+  const before = window.length > days ? window[0] : null;
+
+  return visible.map((row, index) => {
+    const prev = index === 0 ? before : visible[index - 1];
+    const deltaPb =
+      prev && Number.isFinite(prev.valorNum)
+        ? Number((row.valorNum - prev.valorNum).toFixed(1))
+        : null;
+    return {
+      fecha: row.fecha,
+      valor: formatPb(row.valorNum),
+      deltaPb,
+    };
+  });
+}
+
+async function getRiesgoPaisSeries() {
+  if (riesgoPaisCache && Date.now() - riesgoPaisCache.at < RIESGO_PAIS_TTL_MS) {
+    return riesgoPaisCache.series;
+  }
+
+  const { value: series } = await withFallbacks(
+    [
+      { name: 'argentinadatos-ipv4', fetch: () => fetchRiesgoPaisSeries(jsonHttp) },
+      { name: 'argentinadatos-auto', fetch: () => fetchRiesgoPaisSeries(jsonHttpAuto) },
+      { name: 'argentinadatos-http', fetch: () => fetchRiesgoPaisSeries(http) },
+      { name: 'argentinadatos-ultimo-ipv4', fetch: () => fetchRiesgoPaisUltimo(jsonHttp) },
+      { name: 'argentinadatos-ultimo-auto', fetch: () => fetchRiesgoPaisUltimo(jsonHttpAuto) },
+    ],
+    {
+      label: 'riesgo-pais',
+      isValid: (s) => Array.isArray(s) && s.length > 0,
+    }
+  );
+
+  riesgoPaisCache = { at: Date.now(), series };
+  return series;
+}
+
+app.get('/api/v1/riesgo-pais', async (_req, res) => {
+  try {
+    const series = await getRiesgoPaisSeries();
+    const historial = buildRiesgoPaisHistorial(series, 7);
+    const latest = historial[historial.length - 1];
+    if (!latest) {
+      return res.status(404).send('Riesgo país no encontrado');
+    }
+
+    const deltaPb = latest.deltaPb;
+    const payload = {
+      valor: latest.valor,
+      unidad: 'pb',
+      fecha: latest.fecha,
+      variacion:
+        deltaPb == null
+          ? null
+          : {
+              puntos: deltaPb,
+              unidad: 'pb',
+              direccion: deltaPb > 0 ? 'up' : deltaPb < 0 ? 'down' : 'flat',
+            },
+      historial,
+    };
+
+    console.log(`Riesgo país (${payload.fecha}): ${payload.valor} pb`);
+    res.status(200).json(payload);
+  } catch (error) {
+    if (error instanceof AllSourcesFailedError) {
+      if (error.lastError) return sendError(res, error.lastError);
+      return res.status(404).send('Riesgo país no encontrado');
+    }
+    sendError(res, error);
+  }
+});
+
 async function buildTasaBcraPayload(selectedMeta) {
   const { value: latestBundle } = await withFallbacks(
     [
