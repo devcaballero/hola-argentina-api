@@ -49,6 +49,8 @@ curl http://localhost:3000/api/v1/bitcoin
 | GET | `/api/v1/inflacion-anualizada` | IPC interanual + período |
 | GET | `/api/v1/tasa-bcra` | BADLAR/TPM + historial mensual 6 meses |
 | GET | `/api/v1/riesgo-pais` | EMBI+ (pb) + variación + historial 7 días |
+| GET | `/api/v1/uva` | UVA (BCRA id 31) + Δ% + historial 7 días |
+| GET | `/api/v1/cer` | CER (BCRA id 30) + Δ% + historial 7 días |
 | GET | `/api/v1/temperatura` | Clima BA + forecast 7 días (condición, viento, humedad, salida/puesta) |
 | GET | `/api/v1/minimo-sube` | Tarifa mínima AMBA |
 | GET | `/api/v1/nafta-super` | Nafta súper |
@@ -65,6 +67,7 @@ Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual pu
 - Oro: [goldprice.dev](https://goldprice.dev) spot + barras diarias
 - Inflación: [apis.datos.gob.ar](https://apis.datos.gob.ar) (IPC nacional)
 - Tasa: [API BCRA v4](https://api.bcra.gob.ar) monetarias — BADLAR → TPM
+- UVA / CER: [API BCRA v4](https://api.bcra.gob.ar) monetarias — ids 31 (UVA) y 30 (CER), diarios
 - Riesgo país: [ArgentinaDatos](https://api.argentinadatos.com) EMBI+ (serie → último)
 - Clima (en paralelo; se prefiere forecast de 7 días):
   1. [Open-Meteo](https://open-meteo.com) (varios transportes / IPv4)
@@ -73,7 +76,7 @@ Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual pu
   - Si faltan salida/puesta (Met.no no las trae; wttr solo ~3 días), se completan con cálculo local NOAA para CABA (UTC−3)
 - Big Mac: [bigmacindex.com](https://bigmacindex.com) → CSV [The Economist](https://github.com/TheEconomist/big-mac-data)
 
-Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h, riesgo país ~1h) para no martillar las fuentes.
+Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h, riesgo país ~1h, UVA/CER ~1h) para no martillar las fuentes.
 
 ## Fallbacks
 

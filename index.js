@@ -1136,6 +1136,121 @@ app.get('/api/v1/riesgo-pais', async (_req, res) => {
   }
 });
 
+/** CER id 30 · UVA id 31 (Principales Variables BCRA, diarios). */
+const BCRA_DAILY_INDEX_TTL_MS = 60 * 60 * 1000;
+const bcraDailyIndexCache = new Map();
+
+function formatBcraIndexValue(value, decimals) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return n.toLocaleString('es-AR', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+
+/** Últimas N observaciones diarias con Δ% vs el día previo. */
+function buildBcraDailyHistorial(series, days = 7, decimals = 2) {
+  if (!series.length) return [];
+
+  const window = series.slice(-(days + 1));
+  const visible = window.slice(-days);
+  const before = window.length > days ? window[0] : null;
+
+  return visible.map((row, index) => {
+    const prev = index === 0 ? before : visible[index - 1];
+    let deltaPct = null;
+    if (prev && Number.isFinite(prev.valorNum) && prev.valorNum !== 0) {
+      deltaPct = Number((((row.valorNum - prev.valorNum) / prev.valorNum) * 100).toFixed(2));
+    }
+    return {
+      fecha: row.fecha,
+      valor: formatBcraIndexValue(row.valorNum, decimals),
+      valorNum: row.valorNum,
+      deltaPct,
+    };
+  });
+}
+
+async function getBcraDailyIndexSeries(idVariable) {
+  const cached = bcraDailyIndexCache.get(idVariable);
+  if (cached && Date.now() - cached.at < BCRA_DAILY_INDEX_TTL_MS) {
+    return cached.series;
+  }
+  const series = await getBcraVariableSeries(idVariable, 40);
+  if (!series.length) throw new Error(`serie BCRA ${idVariable} vacía`);
+  bcraDailyIndexCache.set(idVariable, { at: Date.now(), series });
+  return series;
+}
+
+async function buildBcraDailyIndexPayload({
+  idVariable,
+  codigo,
+  nombre,
+  meta,
+  decimals,
+}) {
+  const series = await getBcraDailyIndexSeries(idVariable);
+  const historial = buildBcraDailyHistorial(series, 7, decimals);
+  const latest = historial[historial.length - 1];
+  if (!latest) throw new Error(`${codigo} sin observaciones`);
+
+  const deltaPct = latest.deltaPct;
+  return {
+    valor: latest.valor,
+    codigo,
+    nombre,
+    meta,
+    unidad: codigo === 'UVA' ? 'ARS' : 'índice',
+    fecha: latest.fecha,
+    variacion:
+      deltaPct == null
+        ? null
+        : {
+            porcentaje: deltaPct,
+            unidad: '%',
+            direccion: deltaPct > 0 ? 'up' : deltaPct < 0 ? 'down' : 'flat',
+          },
+    historial: historial.map(({ fecha, valor, deltaPct: d }) => ({
+      fecha,
+      valor,
+      deltaPct: d,
+    })),
+  };
+}
+
+app.get('/api/v1/uva', async (_req, res) => {
+  try {
+    const payload = await buildBcraDailyIndexPayload({
+      idVariable: 31,
+      codigo: 'UVA',
+      nombre: 'UVA',
+      meta: 'Préstamos / plazos fijos · BCRA',
+      decimals: 2,
+    });
+    console.log(`UVA (${payload.fecha}): ${payload.valor}`);
+    res.status(200).json(payload);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get('/api/v1/cer', async (_req, res) => {
+  try {
+    const payload = await buildBcraDailyIndexPayload({
+      idVariable: 30,
+      codigo: 'CER',
+      nombre: 'CER',
+      meta: 'Coef. estabilización · BCRA',
+      decimals: 4,
+    });
+    console.log(`CER (${payload.fecha}): ${payload.valor}`);
+    res.status(200).json(payload);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 async function buildTasaBcraPayload(selectedMeta) {
   const { value: latestBundle } = await withFallbacks(
     [
