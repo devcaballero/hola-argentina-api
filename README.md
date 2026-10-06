@@ -56,7 +56,9 @@ curl http://localhost:3000/api/v1/bitcoin
 | GET | `/api/v1/nafta-super` | Nafta súper |
 | GET | `/api/v1/promedio-precio-asado` | Asado $/kg |
 | GET | `/api/v1/promedio-precio-pan` | Pan $/kg |
-| GET | `/api/v1/bigmac` | Big Mac ARS |
+| GET | `/api/v1/precio-bigmac` | Precio Big Mac (JSON): precio, fecha del relevamiento, última verificación, fuente, `stale` |
+| GET | `/api/v1/bigmac` | Legado: mismo precio en texto plano |
+| GET | `/api/v1/noticias` | Feed "Hoy en Buenos Aires" (RSS de medios, filtros `geo`, `tema`, `medio`, `limit`) |
 
 Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual puede no mostrar.
 
@@ -74,15 +76,34 @@ Hay endpoints legacy adicionales (Fernet, Heineken, etc.) que el front actual pu
   2. [Met.no](https://api.met.no) locationforecast (rescate 7 días)
   3. [wttr.in](https://wttr.in) (~3 días) — si queda como base, se extiende con Met.no/OM
   - Si faltan salida/puesta (Met.no no las trae; wttr solo ~3 días), se completan con cálculo local NOAA para CABA (UTC−3)
-- Big Mac: [bigmacindex.com](https://bigmacindex.com) → CSV [The Economist](https://github.com/TheEconomist/big-mac-data)
+- Big Mac: CSV abierto de [The Economist](https://github.com/TheEconomist/big-mac-data) (CC BY 4.0, `local_price` de ARG, relevamiento semestral; `lib/bigmac.js`, caché 12 h con último dato conocido marcado `stale`). Ya no se scrapea bigmacindex.com: sus términos lo prohíben fuera de su API y su precio es de delivery (Rappi).
 
-Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h, riesgo país ~1h, UVA/CER ~1h) para no martillar las fuentes.
+Varias respuestas se cachean en memoria (dólar ~1h, BTC ~15m, oro ~30m, IPC ~6h, riesgo país ~1h, UVA/CER ~1h, noticias ~12m) para no martillar las fuentes.
+
+## Noticias (`lib/news/`)
+
+Titulares y links de RSS oficiales (Clarín, La Nación, Infobae, TN, Página/12), clasificados por zona (CABA / AMBA / Argentina) y tema (transporte, ciudad, economía, agenda) con reglas explícitas en `lib/news/rules.js`.
+
+- Query: `geo=caba|amba|argentina` (anidado: CABA ⊂ AMBA ⊂ Argentina), `tema=todas|transporte|ciudad|economia|agenda`, `medio=<id>|todos`, `limit=1..40` (default 8).
+- Coberturas del mismo evento se agrupan de forma conservadora (`lib/news/cluster.js`): cada ítem trae `related` con las otras notas (título, medio y link propios). `limit`/`total` cuentan grupos; `totalNotes`, notas.
+- Respuesta: `items`, `total`, `totalNotes`, `facets` (conteos por dimensión con los otros filtros aplicados), `sources` (estado por medio), `updatedAt` (último refresco con datos), `checkedAt` (último intento), `stale`.
+- Caché compartida en memoria, stale-while-revalidate cada 12 min (`NEWS_TTL_MINUTES`, 5–60). Un solo refresco a la vez; timeout por feed (8 s) y por medio (15 s). Si un medio cae se conservan sus notas hasta 6 h; si caen todos se mantiene el último snapshot. Sin datos previos → `503`.
+- Solo se exponen título, link, medio y fecha: Clarín licencia "títulos y/o links" de su RSS y el resto no publica condiciones de reutilización.
+- `NEWS_DISABLED_SOURCES=tn,infobae` apaga medios sin tocar código.
+
+Detalle completo, fuentes verificadas y limitaciones: `../AUDITORIA-NOTICIAS.md`.
+
+## Tests
+
+```bash
+npm test   # node --test (clasificación, deduplicación, agrupación, ranking, fallos)
+```
 
 ## Fallbacks
 
 Helper reutilizable en `lib/fallbacks.js`:
 
-- `withFallbacks(sources, { label })` — cadena secuencial (primera fuente válida gana). Usado en Bitcoin, Big Mac, tasa BCRA y riesgo país.
+- `withFallbacks(sources, { label })` — cadena secuencial (primera fuente válida gana). Usado en Bitcoin, tasa BCRA y riesgo país.
 - `collectFromSources(sources, { label })` — acumula las que respondan (promedios asado/pan).
 
 Clima usa `Promise.allSettled` propio (Open-Meteo / Met.no / wttr) más `ensureForecastSunTimes` para astronomía.
@@ -91,7 +112,8 @@ Para agregar una alternativa a un endpoint nuevo: definir `{ name, fetch }` y pa
 
 ## Gitflow
 
-- **Features:** salen de `develop` → PR a `develop` → release PR `develop` → `main`
+- **Features:** salen de `develop` → PR a `develop` → rama `release/*` desde `develop` → PR de la release a `main`
+- **Cierre de release:** después del merge a `main`, sincronizar los cambios de la release nuevamente hacia `develop`
 - **Fixes:** salen de `main` → PR a `main` → backport/PR a `develop`
 
 ## Deploy
