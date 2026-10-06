@@ -112,7 +112,8 @@ Para agregar una alternativa a un endpoint nuevo: definir `{ name, fetch }` y pa
 
 ## Gitflow
 
-- **Features:** salen de `develop` → PR a `develop` → release PR `develop` → `main`
+- **Features:** salen de `develop` → PR a `develop` → rama `release/*` desde `develop` → PR de la release a `main`
+- **Cierre de release:** después del merge a `main`, sincronizar los cambios de la release nuevamente hacia `develop`
 - **Fixes:** salen de `main` → PR a `main` → backport/PR a `develop`
 
 ## Deploy
