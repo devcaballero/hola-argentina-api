@@ -9,6 +9,11 @@ const {
   collectFromSources,
   AllSourcesFailedError,
 } = require('./lib/fallbacks');
+const { enabledSources } = require('./lib/news/sources');
+const { createNewsService, NoNewsDataError } = require('./lib/news/service');
+const { createBigMacService } = require('./lib/bigmac');
+const { baTodayIso, baDateOfInstant, addDaysIso } = require('./lib/dates');
+const H = require('./lib/historial');
 
 // En Render, resolver IPv6 primero suele colgar APIs externas (Open-Meteo).
 try {
@@ -83,6 +88,27 @@ const bcraHttp = axios.create({
     rejectUnauthorized: false,
   }),
   validateStatus: (status) => status >= 200 && status < 400,
+});
+
+/** RSS de medios: timeout corto por feed y tope de tamaño (los feeds Arc pesan ~1 MB). */
+const newsHttp = axios.create({
+  timeout: 8000,
+  maxContentLength: 4 * 1024 * 1024,
+  maxRedirects: 3,
+  responseType: 'text',
+  headers: {
+    'User-Agent': 'hola-argentina-api/1.1 (+https://github.com/devcaballero/hola-argentina-api)',
+    Accept: 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8',
+  },
+  httpsAgent: ipv4HttpsAgent,
+  validateStatus: (status) => status >= 200 && status < 300,
+});
+
+const newsTtlMinutes = Number(process.env.NEWS_TTL_MINUTES);
+const newsService = createNewsService({
+  sources: enabledSources(),
+  fetchText: (url) => newsHttp.get(url).then((r) => String(r.data)),
+  ...(newsTtlMinutes >= 5 && newsTtlMinutes <= 60 ? { ttlMs: newsTtlMinutes * 60 * 1000 } : {}),
 });
 
 function sendError(res, error, fallback = 'Error en el servidor') {
@@ -238,9 +264,15 @@ async function getDolarCotizacion(tipo) {
   if (!compra || !venta) {
     throw new Error(`Cotización ${tipo} inválida`);
   }
+  const actualizadoMs = Date.parse(data?.fechaActualizacion);
   return {
     compra: compra.replace('.', ','),
     venta: venta.replace('.', ','),
+    compraNum: Number(data.compra),
+    ventaNum: Number(data.venta),
+    // Fecha del dato según la fuente (instante → día de Buenos Aires); null si no la informa.
+    actualizadoAt: Number.isFinite(actualizadoMs) ? new Date(actualizadoMs).toISOString() : null,
+    fecha: Number.isFinite(actualizadoMs) ? baDateOfInstant(actualizadoMs) : null,
   };
 }
 
@@ -274,55 +306,7 @@ async function getDolarHistorialSeries(tipo) {
   return series;
 }
 
-function pctChange(from, to) {
-  if (from == null || to == null || Number(from) === 0) return null;
-  return ((Number(to) - Number(from)) / Number(from)) * 100;
-}
-
-function isoMinusDays(isoDate, days) {
-  const [y, m, d] = isoDate.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d - days)).toISOString().slice(0, 10);
-}
-
-function buildDolarHistorial(series, days = 7) {
-  if (!series.length) {
-    return { historial: [], variacion: null };
-  }
-
-  const end = series[series.length - 1].fecha;
-  const start = isoMinusDays(end, days - 1);
-  const windowDays = series.filter((day) => day.fecha >= start && day.fecha <= end);
-
-  const beforeIndex = series.findIndex((day) => day.fecha === windowDays[0]?.fecha) - 1;
-  const before = beforeIndex >= 0 ? series[beforeIndex] : null;
-
-  const historial = windowDays.map((day, index) => {
-    const prev = index === 0 ? before : windowDays[index - 1];
-    const variacionPct = pctChange(prev?.venta, day.venta);
-    return {
-      fecha: day.fecha,
-      compra: day.compra,
-      venta: day.venta,
-      variacionPct: variacionPct == null ? null : Number(variacionPct.toFixed(2)),
-    };
-  });
-
-  const hoy = historial[historial.length - 1] || null;
-  const ayer = historial.length >= 2 ? historial[historial.length - 2] : null;
-  const variacionPct = hoy ? hoy.variacionPct : null;
-
-  return {
-    historial,
-    variacion:
-      variacionPct == null || !hoy
-        ? null
-        : {
-            porcentaje: variacionPct,
-            absoluta: ayer ? Number((hoy.venta - ayer.venta).toFixed(2)) : null,
-            direccion: variacionPct > 0 ? 'up' : variacionPct < 0 ? 'down' : 'flat',
-          },
-  };
-}
+// buildDolarHistorial → lib/historial.js (ventana por calendario de Buenos Aires).
 
 async function getDolarPayload(tipo) {
   const [cotizacion, series] = await Promise.all([
@@ -333,10 +317,15 @@ async function getDolarPayload(tipo) {
     }),
   ]);
 
-  const { historial, variacion } = buildDolarHistorial(series, 7);
+  // Variación de la cotización vigente (dolarapi) contra el registro de ArgentinaDatos ANTERIOR a la
+  // fecha de esa cotización. Antes se comparaban dos filas de ArgentinaDatos, incluida una fila del
+  // día en curso publicada antes de operar (0,00 % sin respaldo).
+  const live = cotizacion.fecha ? { fecha: cotizacion.fecha, venta: cotizacion.ventaNum } : null;
+  const { historial, variacion } = H.buildDolarHistorial(series, baTodayIso(), 7, live);
   return {
     ...cotizacion,
-    variacion,
+    variacion: live ? variacion : null,
+    consultadoAt: new Date().toISOString(),
     historial,
   };
 }
@@ -375,8 +364,10 @@ async function getOroPayload() {
     return oroCache.payload;
   }
 
-  const toIso = new Date().toISOString().slice(0, 10);
-  const fromIso = isoMinusDays(toIso, 10);
+  // "Hoy" en Buenos Aires (no el día UTC); la API de barras recibe fechas y se pide un día de margen.
+  const today = baTodayIso();
+  const toIso = addDaysIso(today, 1);
+  const fromIso = addDaysIso(today, -10);
 
   const [{ data: spotData }, { data: barsData }] = await Promise.all([
     http.get('https://api.goldprice.dev/v1/prices', {
@@ -397,13 +388,16 @@ async function getOroPayload() {
     const close = Number(bar?.close);
     const start = bar?.bar_start;
     if (!start || !Number.isFinite(close)) continue;
-    const fecha = String(start).slice(0, 10);
-    byFecha.set(fecha, close);
+    // Barra diaria: se asigna al día de Buenos Aires de su cierre (un instante), no a su fecha UTC.
+    const startMs = Date.parse(start);
+    if (!Number.isFinite(startMs)) continue;
+    byFecha.set(baDateOfInstant(H.candleCloseInstant(startMs)), close);
   }
 
+  // Spot actual: es un instante (ahora) → corresponde a hoy en Buenos Aires.
   const live = Number(spotData?.symbols?.[0]?.price);
   if (Number.isFinite(live)) {
-    byFecha.set(toIso, live);
+    byFecha.set(today, live);
   }
 
   const series = [...byFecha.entries()]
@@ -414,40 +408,10 @@ async function getOroPayload() {
     throw new Error('Historial de oro vacío');
   }
 
-  const end = series[series.length - 1].fecha;
-  const start = isoMinusDays(end, 6);
-  const windowDays = series.filter((day) => day.fecha >= start && day.fecha <= end);
-  const beforeIndex = series.findIndex((day) => day.fecha === windowDays[0]?.fecha) - 1;
-  const before = beforeIndex >= 0 ? series[beforeIndex] : null;
+  const payload = H.buildPricePayload(series, today, 7);
+  if (!payload) throw new Error('Oro sin precio vigente');
 
-  const historial = windowDays.map((day, index) => {
-    const prev = index === 0 ? before : windowDays[index - 1];
-    const variacionPct = pctChange(prev?.precio, day.precio);
-    return {
-      fecha: day.fecha,
-      precio: Number(day.precio.toFixed(2)),
-      variacionPct: variacionPct == null ? null : Number(variacionPct.toFixed(2)),
-    };
-  });
-
-  const hoy = historial[historial.length - 1];
-  const ayer = historial.length >= 2 ? historial[historial.length - 2] : null;
-  const variacionPct = hoy?.variacionPct ?? null;
-
-  const payload = {
-    precio: hoy.precio,
-    precioLabel: hoy.precio.toFixed(2).replace('.', ','),
-    variacion:
-      variacionPct == null
-        ? null
-        : {
-            porcentaje: variacionPct,
-            absoluta: ayer ? Number((hoy.precio - ayer.precio).toFixed(2)) : null,
-            direccion: variacionPct > 0 ? 'up' : variacionPct < 0 ? 'down' : 'flat',
-          },
-    historial,
-  };
-
+  payload.consultadoAt = new Date().toISOString();
   oroCache.at = Date.now();
   oroCache.payload = payload;
   return payload;
@@ -507,8 +471,8 @@ async function getBitcoinPayload() {
 
   console.log(`[bitcoin] fuente: ${source}`);
   bitcoinCache.at = Date.now();
-  bitcoinCache.payload = value;
-  return value;
+  bitcoinCache.payload = { ...value, consultadoAt: new Date(bitcoinCache.at).toISOString() };
+  return bitcoinCache.payload;
 }
 
 async function fetchBitcoinCoinGecko(client) {
@@ -522,17 +486,15 @@ async function fetchBitcoinCoinGecko(client) {
     }
   );
 
-  const byFecha = new Map();
+  const points = [];
   for (const row of data?.prices || []) {
     const [ts, price] = row;
     if (ts == null || price == null || Number.isNaN(Number(price))) continue;
-    const fecha = new Date(Number(ts)).toISOString().slice(0, 10);
-    byFecha.set(fecha, Number(price));
+    points.push({ ts: Number(ts), precio: Number(price) });
   }
 
-  const series = [...byFecha.entries()]
-    .map(([fecha, precio]) => ({ fecha, precio }))
-    .sort((a, b) => a.fecha.localeCompare(b.fecha));
+  // Puntos sueltos (instantes) → día de Buenos Aires; el último del día gana (hoy = precio actual).
+  const series = H.seriesFromInstants(points);
 
   return buildBitcoinPayloadFromSeries(series);
 }
@@ -557,7 +519,7 @@ async function fetchBitcoinBinance(client, baseUrl) {
       const close = Number(row?.[4]);
       if (!Number.isFinite(openTime) || !Number.isFinite(close)) return null;
       return {
-        fecha: new Date(openTime).toISOString().slice(0, 10),
+        fecha: baDateOfInstant(H.candleCloseInstant(openTime)),
         precio: close,
       };
     })
@@ -593,7 +555,7 @@ async function fetchBitcoinCoinbase(client) {
       const close = Number(row?.[4]);
       if (!Number.isFinite(ts) || !Number.isFinite(close)) return null;
       return {
-        fecha: new Date(ts * 1000).toISOString().slice(0, 10),
+        fecha: baDateOfInstant(H.candleCloseInstant(ts * 1000)),
         precio: close,
       };
     })
@@ -633,7 +595,7 @@ async function fetchBitcoinKraken(client) {
       const close = Number(row?.[4]);
       if (!Number.isFinite(ts) || !Number.isFinite(close)) return null;
       return {
-        fecha: new Date(ts * 1000).toISOString().slice(0, 10),
+        fecha: baDateOfInstant(H.candleCloseInstant(ts * 1000)),
         precio: close,
       };
     })
@@ -647,44 +609,11 @@ function buildBitcoinPayloadFromSeries(series) {
   if (!Array.isArray(series) || !series.length) {
     throw new Error('Historial de Bitcoin vacío');
   }
-
-  const end = series[series.length - 1].fecha;
-  const start = isoMinusDays(end, 6);
-  const windowDays = series.filter((day) => day.fecha >= start && day.fecha <= end);
-  const beforeIndex = series.findIndex((day) => day.fecha === windowDays[0]?.fecha) - 1;
-  const before = beforeIndex >= 0 ? series[beforeIndex] : null;
-
-  const historial = windowDays.map((day, index) => {
-    const prev = index === 0 ? before : windowDays[index - 1];
-    const variacionPct = pctChange(prev?.precio, day.precio);
-    return {
-      fecha: day.fecha,
-      precio: Number(day.precio.toFixed(2)),
-      variacionPct: variacionPct == null ? null : Number(variacionPct.toFixed(2)),
-    };
-  });
-
-  if (!historial.length) {
+  const payload = H.buildPricePayload(series, baTodayIso(), 7);
+  if (!payload || !payload.historial.length) {
     throw new Error('Ventana de Bitcoin vacía');
   }
-
-  const hoy = historial[historial.length - 1];
-  const ayer = historial.length >= 2 ? historial[historial.length - 2] : null;
-  const variacionPct = hoy?.variacionPct ?? null;
-
-  return {
-    precio: hoy.precio,
-    precioLabel: hoy.precio.toFixed(2).replace('.', ','),
-    variacion:
-      variacionPct == null
-        ? null
-        : {
-            porcentaje: variacionPct,
-            absoluta: ayer ? Number((hoy.precio - ayer.precio).toFixed(2)) : null,
-            direccion: variacionPct > 0 ? 'up' : variacionPct < 0 ? 'down' : 'flat',
-          },
-    historial,
-  };
+  return payload;
 }
 
 app.get('/api/v1/bitcoin', async (_req, res) => {
@@ -737,54 +666,38 @@ app.get('/api/v1/nafta-super', async (_req, res) => {
   }
 });
 
-app.get('/api/v1/bigmac', async (_req, res) => {
+const bigMacService = createBigMacService({
+  fetchText: (url) => http.get(url, { responseType: 'text' }).then((r) => String(r.data)),
+});
+
+/**
+ * Precio de la Big Mac (JSON con procedencia): precio, fecha del dato, última verificación,
+ * fuente y `stale` si se sirve el último dato conocido tras un fallo. Ver lib/bigmac.js.
+ */
+app.get('/api/v1/precio-bigmac', async (_req, res) => {
   try {
-    const { value: precio, source } = await withFallbacks(
-      [
-        { name: 'bigmacindex', fetch: fetchBigMacFromIndex },
-        { name: 'economist-csv', fetch: fetchBigMacFromEconomist },
-      ],
-      {
-        label: 'bigmac',
-        isValid: (v) => typeof v === 'string' && v.length > 0 && v !== 'NaN',
-      }
-    );
-    console.log(`El precio del bigmac (${source}) es : ${precio}`);
-    res.status(200).send(precio);
+    const payload = await bigMacService.get();
+    res.set('Cache-Control', 'public, max-age=600');
+    res.status(payload.available ? 200 : 503).json(payload);
   } catch (error) {
-    if (error instanceof AllSourcesFailedError) {
-      return res.status(404).send('Precio del bigmac no encontrado');
-    }
     sendError(res, error);
   }
 });
 
-/** Precio local en ARS desde bigmacindex (actualización frecuente). */
-async function fetchBigMacFromIndex() {
-  const { data: html } = await http.get('https://bigmacindex.com/country/argentina');
-  const match = String(html).match(/ARS\s*([\d.,]+)/i);
-  const precio = match?.[1]?.replace(/[^\d]/g, '');
-  if (!precio) throw new Error('bigmacindex sin precio ARS');
-  return precio;
-}
-
-/** Fallback: Big Mac Index de The Economist (CSV semi-anual). */
-async function fetchBigMacFromEconomist() {
-  const { data: csv } = await http.get(
-    'https://raw.githubusercontent.com/TheEconomist/big-mac-data/master/output-data/big-mac-raw-index.csv'
-  );
-  const rows = String(csv)
-    .trim()
-    .split('\n')
-    .filter((line) => line.includes(',ARG,') || line.includes(',Argentina,'));
-  const latest = rows[rows.length - 1];
-  if (!latest) throw new Error('CSV Economist sin fila ARG');
-  // date,iso_a3,currency_code,name,local_price,...
-  const localPrice = latest.split(',')[4];
-  const precio = String(Math.round(Number(localPrice)));
-  if (!precio || precio === 'NaN') throw new Error('CSV Economist sin local_price válido');
-  return precio;
-}
+/**
+ * Legado (texto plano) para el front ya desplegado. Misma fuente que /precio-bigmac.
+ * Antes: bigmacindex.com (scraping; verificado el 2026-10-05: el regex no encontraba el precio y siempre caía al CSV) → CSV de The Economist.
+ */
+app.get('/api/v1/bigmac', async (_req, res) => {
+  try {
+    const payload = await bigMacService.get();
+    if (!payload.available) return res.status(404).send('Precio del bigmac no encontrado');
+    console.log(`El precio del bigmac (economist ${payload.priceDate}${payload.stale ? ', desactualizado' : ''}) es : ${payload.price}`);
+    res.status(200).send(String(Math.round(payload.price)));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
 
 app.get('/api/v1/heineken', async (_req, res) => {
   try {
@@ -1056,26 +969,7 @@ async function fetchRiesgoPaisUltimo(client) {
 }
 
 /** Últimas N observaciones (días hábiles; fines de semana suele no haber dato). */
-function buildRiesgoPaisHistorial(series, days = 7) {
-  if (!series.length) return [];
-
-  const window = series.slice(-(days + 1));
-  const visible = window.slice(-days);
-  const before = window.length > days ? window[0] : null;
-
-  return visible.map((row, index) => {
-    const prev = index === 0 ? before : visible[index - 1];
-    const deltaPb =
-      prev && Number.isFinite(prev.valorNum)
-        ? Number((row.valorNum - prev.valorNum).toFixed(1))
-        : null;
-    return {
-      fecha: row.fecha,
-      valor: formatPb(row.valorNum),
-      deltaPb,
-    };
-  });
-}
+// buildRiesgoPaisHistorial → lib/historial.js (H.buildRiesgoPais).
 
 async function getRiesgoPaisSeries() {
   if (riesgoPaisCache && Date.now() - riesgoPaisCache.at < RIESGO_PAIS_TTL_MS) {
@@ -1103,15 +997,14 @@ async function getRiesgoPaisSeries() {
 app.get('/api/v1/riesgo-pais', async (_req, res) => {
   try {
     const series = await getRiesgoPaisSeries();
-    const historial = buildRiesgoPaisHistorial(series, 7);
-    const latest = historial[historial.length - 1];
+    const { latest, deltaPb, referencia, historial } = H.buildRiesgoPais(series, baTodayIso(), { days: 7, format: formatPb });
     if (!latest) {
       return res.status(404).send('Riesgo país no encontrado');
     }
 
-    const deltaPb = latest.deltaPb;
     const payload = {
-      valor: latest.valor,
+      valor: formatPb(latest.valorNum),
+      valorNum: latest.valorNum,
       unidad: 'pb',
       fecha: latest.fecha,
       variacion:
@@ -1121,7 +1014,9 @@ app.get('/api/v1/riesgo-pais', async (_req, res) => {
               puntos: deltaPb,
               unidad: 'pb',
               direccion: deltaPb > 0 ? 'up' : deltaPb < 0 ? 'down' : 'flat',
+              referencia,
             },
+      consultadoAt: riesgoPaisCache ? new Date(riesgoPaisCache.at).toISOString() : null,
       historial,
     };
 
@@ -1150,34 +1045,15 @@ function formatBcraIndexValue(value, decimals) {
 }
 
 /** Últimas N observaciones diarias con Δ% vs el día previo. */
-function buildBcraDailyHistorial(series, days = 7, decimals = 2) {
-  if (!series.length) return [];
-
-  const window = series.slice(-(days + 1));
-  const visible = window.slice(-days);
-  const before = window.length > days ? window[0] : null;
-
-  return visible.map((row, index) => {
-    const prev = index === 0 ? before : visible[index - 1];
-    let deltaPct = null;
-    if (prev && Number.isFinite(prev.valorNum) && prev.valorNum !== 0) {
-      deltaPct = Number((((row.valorNum - prev.valorNum) / prev.valorNum) * 100).toFixed(2));
-    }
-    return {
-      fecha: row.fecha,
-      valor: formatBcraIndexValue(row.valorNum, decimals),
-      valorNum: row.valorNum,
-      deltaPct,
-    };
-  });
-}
+// buildBcraDailyHistorial → lib/historial.js (H.buildBcraDailyIndex).
 
 async function getBcraDailyIndexSeries(idVariable) {
   const cached = bcraDailyIndexCache.get(idVariable);
   if (cached && Date.now() - cached.at < BCRA_DAILY_INDEX_TTL_MS) {
     return cached.series;
   }
-  const series = await getBcraVariableSeries(idVariable, 40);
+  // 45 días hacia adelante: incluye valores ya publicados con vigencia futura (conservan su fecha).
+  const series = await getBcraVariableSeries(idVariable, 40, 45);
   if (!series.length) throw new Error(`serie BCRA ${idVariable} vacía`);
   bcraDailyIndexCache.set(idVariable, { at: Date.now(), series });
   return series;
@@ -1191,31 +1067,27 @@ async function buildBcraDailyIndexPayload({
   decimals,
 }) {
   const series = await getBcraDailyIndexSeries(idVariable);
-  const historial = buildBcraDailyHistorial(series, 7, decimals);
-  const latest = historial[historial.length - 1];
-  if (!latest) throw new Error(`${codigo} sin observaciones`);
+  // El BCRA publica UVA/CER con vigencia futura: se filtra por "hoy" en BA en cada request
+  // (la caché puede cruzar la medianoche), no al consultar.
+  const today = baTodayIso();
+  const { latest, variacion, historial } = H.buildBcraDailyIndex(series, {
+    today, days: 7, decimals, format: formatBcraIndexValue,
+  });
+  if (!latest) throw new Error(`${codigo} sin observaciones vigentes`);
+  const cached = bcraDailyIndexCache.get(idVariable);
 
-  const deltaPct = latest.deltaPct;
   return {
-    valor: latest.valor,
+    valor: formatBcraIndexValue(latest.valorNum, decimals),
+    valorNum: latest.valorNum,
+    decimales: decimals,
     codigo,
     nombre,
     meta,
     unidad: codigo === 'UVA' ? 'ARS' : 'índice',
     fecha: latest.fecha,
-    variacion:
-      deltaPct == null
-        ? null
-        : {
-            porcentaje: deltaPct,
-            unidad: '%',
-            direccion: deltaPct > 0 ? 'up' : deltaPct < 0 ? 'down' : 'flat',
-          },
-    historial: historial.map(({ fecha, valor, deltaPct: d }) => ({
-      fecha,
-      valor,
-      deltaPct: d,
-    })),
+    variacion: variacion ? { ...variacion, unidad: '%' } : null,
+    consultadoAt: cached ? new Date(cached.at).toISOString() : null,
+    historial,
   };
 }
 
@@ -1257,7 +1129,9 @@ async function buildTasaBcraPayload(selectedMeta) {
       {
         name: `${selectedMeta.codigo}-serie`,
         fetch: async () => {
-          const series = await getBcraVariableSeries(selectedMeta.idVariable, 220);
+          const today = baTodayIso();
+          const series = (await getBcraVariableSeries(selectedMeta.idVariable, 220))
+            .filter((row) => row.fecha <= today);
           const historial = buildBcraMonthlyHistorial(series, 6);
           const latest = historial[historial.length - 1];
           if (!latest) throw new Error('serie mensual vacía');
@@ -1269,6 +1143,7 @@ async function buildTasaBcraPayload(selectedMeta) {
         fetch: async () => {
           const point = await getBcraVariableLatest(selectedMeta.idVariable);
           if (!point || point.valor == null) throw new Error('sin último valor');
+          if (String(point.fecha).slice(0, 10) > baTodayIso()) throw new Error('último valor con vigencia futura');
           const valorNum = Number(point.valor);
           if (!Number.isFinite(valorNum)) throw new Error('último valor no numérico');
           const latest = {
@@ -1333,9 +1208,11 @@ async function getBcraVariableLatest(idVariable) {
   return { fecha: row.fecha, valor: row.valor };
 }
 
-async function getBcraVariableSeries(idVariable, daysBack = 220) {
-  const hasta = new Date().toISOString().slice(0, 10);
-  const desde = isoMinusDays(hasta, daysBack);
+async function getBcraVariableSeries(idVariable, daysBack = 220, daysAhead = 0) {
+  // Antes: hasta = new Date().toISOString().slice(0, 10) → día UTC; desde las 21 h de BA pedía "mañana".
+  const today = baTodayIso();
+  const hasta = addDaysIso(today, daysAhead);
+  const desde = addDaysIso(today, -daysBack);
   const { data } = await bcraHttp.get(
     `https://api.bcra.gob.ar/estadisticas/v4.0/Monetarias/${idVariable}`,
     {
@@ -2277,6 +2154,30 @@ app.get('/api/v1/promedio-precio-pan', async (_req, res) => {
   }
 });
 
+/**
+ * Feed "Hoy en Buenos Aires". Query: geo (caba|amba|argentina), tema, medio, limit.
+ * La caché es compartida: los medios se consultan como mucho cada NEWS_TTL_MINUTES.
+ */
+app.get('/api/v1/noticias', async (req, res) => {
+  try {
+    const payload = await newsService.query(req.query);
+    res.set('Cache-Control', 'public, max-age=60');
+    res.status(200).json(payload);
+  } catch (error) {
+    if (error instanceof NoNewsDataError) {
+      console.error('[noticias]', error.message);
+      return res.status(503).json({
+        error: 'No pudimos obtener noticias de ninguna fuente.',
+        items: [],
+        sources: error.sources,
+      });
+    }
+    sendError(res, error);
+  }
+});
+
 app.listen(port, () => {
   console.log(`Servidor Express escuchando en el puerto ${port}`);
+  // Precalienta la caché para que la primera visita tras un arranque no espere a los medios.
+  newsService.refresh().catch((error) => console.error('[noticias] precarga falló:', error.message));
 });
