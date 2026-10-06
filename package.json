@@ -4,7 +4,7 @@
   "description": "API Node/Express para Hola Argentina",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/news/*.test.js test/bigmac/*.test.js test/historial/*.test.js",
     "start": "node index.js",
     "start:local": "node index.js"
   },
